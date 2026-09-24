@@ -91,6 +91,10 @@ static VALID_BUCKET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\A[a-zA-Z0-9_-]+\z").unwrap());
 static VALID_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\A[-/_=\.a-zA-Z0-9]+\z").unwrap());
+// Search keys are used as consumer filters, so on top of what a plain key allows they may
+// contain the NATS wildcards: `*` for a single token and `>` for the remaining tokens.
+static VALID_SEARCH_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\A[-/_=\.a-zA-Z0-9*]*[>]?\z").unwrap());
 
 pub(crate) const MAX_HISTORY: i64 = 64;
 const ALL_KEYS: &str = ">";
@@ -107,12 +111,19 @@ pub(crate) fn is_valid_bucket_name(bucket_name: &str) -> bool {
     VALID_BUCKET_RE.is_match(bucket_name)
 }
 
-pub(crate) fn is_valid_key(key: &str) -> bool {
-    if key.is_empty() || key.starts_with('.') || key.ends_with('.') {
-        return false;
-    }
+// Keys become NATS subject tokens, which cannot be empty. This rejects an empty key, a leading
+// or trailing `.`, and `..`.
+fn has_non_empty_tokens(key: &str) -> bool {
+    key.split('.').all(|token| !token.is_empty())
+}
 
-    VALID_KEY_RE.is_match(key)
+pub(crate) fn is_valid_key(key: &str) -> bool {
+    has_non_empty_tokens(key) && VALID_KEY_RE.is_match(key)
+}
+
+// Like `is_valid_key`, but for watch filters, which may contain wildcards.
+pub(crate) fn is_valid_search_key(key: &str) -> bool {
+    has_non_empty_tokens(key) && VALID_SEARCH_KEY_RE.is_match(key)
 }
 
 /// Configuration values for key value stores.
@@ -729,9 +740,12 @@ impl Store {
             .into_iter()
             .map(|key| {
                 let key = key.as_ref();
-                format!("{}{}", self.prefix.as_str(), key)
+                if !is_valid_search_key(key) {
+                    return Err(WatchError::new(WatchErrorKind::InvalidKey));
+                }
+                Ok(format!("{}{}", self.prefix.as_str(), key))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, WatchError>>()?;
 
         debug!("initial consumer creation");
         let consumer = self
@@ -774,7 +788,11 @@ impl Store {
         key: T,
         deliver_policy: DeliverPolicy,
     ) -> Result<Watch, WatchError> {
-        let subject = format!("{}{}", self.prefix.as_str(), key.as_ref());
+        let key = key.as_ref();
+        if !is_valid_search_key(key) {
+            return Err(WatchError::new(WatchErrorKind::InvalidKey));
+        }
+        let subject = format!("{}{}", self.prefix.as_str(), key);
 
         debug!("initial consumer creation");
         let consumer = self
@@ -1612,7 +1630,7 @@ impl Display for CreateErrorKind {
             Self::AlreadyExists => write!(f, "key already exists"),
             Self::Publish => write!(f, "failed to create key in store"),
             Self::Ack => write!(f, "ack error"),
-            Self::InvalidKey => write!(f, "key cannot be empty or start/end with `.`"),
+            Self::InvalidKey => write!(f, "key cannot be empty, start or end with `.`, or contain `..`"),
             Self::Other => write!(f, "other error"),
         }
     }
@@ -1632,7 +1650,7 @@ impl Display for PutErrorKind {
         match self {
             Self::Publish => write!(f, "failed to put key into store"),
             Self::Ack => write!(f, "ack error"),
-            Self::InvalidKey => write!(f, "key cannot be empty or start/end with `.`"),
+            Self::InvalidKey => write!(f, "key cannot be empty, start or end with `.`, or contain `..`"),
         }
     }
 }
@@ -1649,7 +1667,7 @@ pub enum EntryErrorKind {
 impl Display for EntryErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidKey => write!(f, "key cannot be empty or start/end with `.`"),
+            Self::InvalidKey => write!(f, "key cannot be empty, start or end with `.`, or contain `..`"),
             Self::TimedOut => write!(f, "timed out"),
             Self::Other => write!(f, "failed getting entry"),
         }
@@ -1679,7 +1697,7 @@ impl Display for WatchErrorKind {
             Self::ConsumerCreate => write!(f, "watch consumer creation failed"),
             Self::Other => write!(f, "watch failed"),
             Self::TimedOut => write!(f, "timed out"),
-            Self::InvalidKey => write!(f, "key cannot be empty or start/end with `.`"),
+            Self::InvalidKey => write!(f, "key cannot be empty, start or end with `.`, or contain `..`"),
         }
     }
 }
@@ -1700,7 +1718,7 @@ pub enum UpdateErrorKind {
 impl Display for UpdateErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidKey => write!(f, "key cannot be empty or start/end with `.`"),
+            Self::InvalidKey => write!(f, "key cannot be empty, start or end with `.`, or contain `..`"),
             Self::TimedOut => write!(f, "timed out"),
             Self::WrongLastRevision => write!(f, "wrong last revision"),
             Self::Other => write!(f, "failed getting entry"),

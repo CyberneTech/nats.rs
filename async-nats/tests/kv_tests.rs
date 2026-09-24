@@ -1698,4 +1698,114 @@ mod kv {
             }
         }
     }
+
+    /// Keys become NATS subject tokens, so a key that would produce an empty token is rejected
+    /// before it reaches the server.
+    #[tokio::test]
+    async fn invalid_key_rejected_at_client() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = ConnectOptions::new()
+            .connect(server.client_url())
+            .await
+            .unwrap();
+        let context = async_nats::jetstream::new(client);
+
+        let kv = context
+            .create_key_value(kv::Config {
+                bucket: "invalid_key".into(),
+                history: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let payload: Bytes = "data".into();
+
+        for key in ["", ".foo", "foo.", "a..b", "x...y", "foo.*"] {
+            assert_eq!(
+                kv.put(key, payload.clone()).await.unwrap_err().kind(),
+                kv::PutErrorKind::InvalidKey,
+                "{key:?}"
+            );
+            assert_eq!(
+                kv.create(key, payload.clone()).await.unwrap_err().kind(),
+                kv::CreateErrorKind::InvalidKey,
+                "{key:?}"
+            );
+            assert_eq!(
+                kv.update(key, payload.clone(), 1).await.unwrap_err().kind(),
+                kv::UpdateErrorKind::InvalidKey,
+                "{key:?}"
+            );
+            assert_eq!(
+                kv.entry(key).await.unwrap_err().kind(),
+                kv::EntryErrorKind::InvalidKey,
+                "{key:?}"
+            );
+            assert_eq!(
+                kv.delete(key).await.unwrap_err().kind(),
+                kv::DeleteErrorKind::InvalidKey,
+                "{key:?}"
+            );
+            assert_eq!(
+                kv.purge(key).await.unwrap_err().kind(),
+                kv::PurgeErrorKind::InvalidKey,
+                "{key:?}"
+            );
+            // `History` is not `Debug`, so `unwrap_err` is unavailable.
+            assert_eq!(
+                kv.history(key).await.err().unwrap().kind(),
+                kv::HistoryErrorKind::InvalidKey,
+                "{key:?}"
+            );
+        }
+
+        // Single dots still separate tokens.
+        for key in ["a.b.c", "a-b_c=d/e"] {
+            kv.put(key, payload.clone()).await.unwrap();
+            assert!(kv.entry(key).await.unwrap().is_some());
+        }
+    }
+
+    /// Watch filters may contain wildcards, but must still form a valid subject.
+    #[tokio::test]
+    async fn invalid_search_key_rejected_at_client() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = ConnectOptions::new()
+            .connect(server.client_url())
+            .await
+            .unwrap();
+        let context = async_nats::jetstream::new(client);
+
+        let kv = context
+            .create_key_value(kv::Config {
+                bucket: "invalid_search_key".into(),
+                history: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // `Watch` is not `Debug`, so `unwrap_err` is unavailable.
+        for key in ["", ".foo", "a..b", "foo.>.bar", ">.foo", "a>b"] {
+            for result in [
+                kv.watch(key).await,
+                kv.watch_with_history(key).await,
+                kv.watch_from_revision(key, 1).await,
+                kv.watch_many([key, "ok"]).await,
+                kv.watch_many_with_history([key, "ok"]).await,
+            ] {
+                assert_eq!(
+                    result.err().unwrap().kind(),
+                    kv::WatchErrorKind::InvalidKey,
+                    "{key:?}"
+                );
+            }
+        }
+
+        for key in [">", "*", "foo.>", "foo.*.bar"] {
+            kv.watch(key).await.unwrap();
+            kv.watch_many([key]).await.unwrap();
+        }
+    }
 }
