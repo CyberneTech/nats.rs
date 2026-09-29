@@ -982,31 +982,42 @@ impl tokio::io::AsyncRead for Object {
 
         if self.has_pending_messages {
             if self.subscription.is_none() {
-                let future = match self.subscription_future.as_mut() {
-                    Some(future) => future,
-                    None => {
-                        let stream = self.stream.clone();
-                        let bucket = self.info.bucket.clone();
-                        let nuid = self.info.nuid.clone();
-                        self.subscription_future.insert(Box::pin(async move {
-                            stream
-                                .create_consumer(OrderedConfig {
-                                    deliver_subject: stream.context.client.new_inbox(),
-                                    filter_subject: format!("$O.{bucket}.C.{nuid}"),
-                                    ..Default::default()
-                                })
-                                .await
-                                .unwrap()
-                                .messages()
-                                .await
-                        }))
-                    }
-                };
+                // Take the future out and put it back only while pending: a finished
+                // future must not be polled again on a retried read.
+                let mut future: BoxFuture<'static, Result<Ordered, StreamError>> =
+                    match self.subscription_future.take() {
+                        Some(future) => future,
+                        None => {
+                            let stream = self.stream.clone();
+                            let bucket = self.info.bucket.clone();
+                            let nuid = self.info.nuid.clone();
+                            Box::pin(async move {
+                                stream
+                                    .create_consumer(OrderedConfig {
+                                        deliver_subject: stream.context.client.new_inbox(),
+                                        filter_subject: format!("$O.{bucket}.C.{nuid}"),
+                                        ..Default::default()
+                                    })
+                                    .await?
+                                    .messages()
+                                    .await
+                            })
+                        }
+                    };
                 match future.as_mut().poll(cx) {
                     Poll::Ready(subscription) => {
-                        self.subscription = Some(subscription.unwrap());
+                        // Keep the timeout kind visible through the `io::Error`.
+                        self.subscription = Some(subscription.map_err(|err| {
+                            let kind = match err.kind() {
+                                StreamErrorKind::TimedOut => std::io::ErrorKind::TimedOut,
+                                _ => std::io::ErrorKind::Other,
+                            };
+                            std::io::Error::new(kind, err)
+                        })?);
                     }
-                    Poll::Pending => (),
+                    Poll::Pending => {
+                        self.subscription_future = Some(future);
+                    }
                 }
             }
             if let Some(subscription) = self.subscription.as_mut() {

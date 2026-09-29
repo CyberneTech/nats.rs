@@ -716,6 +716,82 @@ mod object_store {
         assert_eq!(result, 0);
     }
 
+    // A failed subscribe must surface as an error on every read, not panic on the retry.
+    #[tokio::test]
+    async fn read_after_a_failed_subscribe_is_an_error_not_a_panic() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let jetstream = async_nats::jetstream::new(client);
+
+        let bucket = jetstream
+            .create_object_store(async_nats::jetstream::object_store::Config {
+                bucket: "bucket".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        bucket
+            .put("FOO", &mut "some data".as_bytes())
+            .await
+            .unwrap();
+
+        let mut object = bucket.get("FOO").await.unwrap();
+
+        // The consumer is created on the first read; removing the bucket makes that fail.
+        jetstream.delete_object_store("bucket").await.unwrap();
+
+        let mut buffer = [0; 8];
+        object.read(&mut buffer).await.unwrap_err();
+        object.read(&mut buffer).await.unwrap_err();
+    }
+
+    // A timed-out read must surface as `io::ErrorKind::TimedOut`.
+    #[tokio::test]
+    async fn a_timed_out_read_keeps_its_kind() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+
+        // Only the reading client gets a short request timeout.
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+
+        let bucket = jetstream
+            .create_object_store(async_nats::jetstream::object_store::Config {
+                bucket: "bucket".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        bucket
+            .put("FOO", &mut "some data".as_bytes())
+            .await
+            .unwrap();
+
+        let impatient = async_nats::jetstream::new(
+            async_nats::ConnectOptions::new()
+                .request_timeout(Some(Duration::from_millis(500)))
+                .connect(server.client_url())
+                .await
+                .unwrap(),
+        );
+        let mut object = impatient
+            .get_object_store("bucket")
+            .await
+            .unwrap()
+            .get("FOO")
+            .await
+            .unwrap();
+
+        // The consumer request sent by the first read times out against a dead server.
+        drop(server);
+
+        let mut buffer = [0; 8];
+        let err = object.read(&mut buffer).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
     #[tokio::test]
     async fn object_info_header_backward_compatibility() {
         // Test that ObjectInfo can deserialize both old and new HeaderMap formats
